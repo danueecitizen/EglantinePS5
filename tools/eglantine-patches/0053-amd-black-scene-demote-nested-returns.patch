@@ -1,0 +1,42 @@
+From: Inc0rporate <263078185+Inc0rporate@users.noreply.github.com>
+Subject: [PATCH] shader: count nested returns before moving demotes to the end (AMD black scene) (#127)
+
+DemoteCombinationPass, which only runs on AMD drivers (needs_demote_reorder),
+moves the program's demotes to just before the last epilogue and is meant to
+give up when there is more than one return. It only counted Epilogue blocks at
+branch depth 1 or less, so a nested early return was missed.
+
+Count returns at any depth so such programs keep their demote in place.
+---
+ src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp b/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp
+index 287ef65..8ad0e43 100644
+--- a/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp
++++ b/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp
+@@ -904,16 +904,18 @@ class TranslatePass {
+             if (node.type != Type::Block) {
+                 continue;
+             }
+-            if (branch_depth > 1) {
+-                // Skip reordering nested demote branches.
+-                continue;
+-            }
+             for (const IR::Inst& inst : node.data.block->Instructions()) {
+                 const IR::Opcode op{inst.GetOpcode()};
+                 if (op == IR::Opcode::DemoteToHelperInvocation) {
+-                    demote_blocks.push_back(node.data.block);
++                    // Skip reordering nested demote branches.
++                    if (branch_depth <= 1) {
++                        demote_blocks.push_back(node.data.block);
++                    }
+                     break;
+                 }
++                // Returns count at any depth: a nested early return (an EXIT under two
++                // conditions, as native fragment programs end their discarded invocations) would
++                // otherwise leave before the demote moved to the end, and write its colours.
+                 if (op == IR::Opcode::Epilogue) {
+                     ++num_epilogues;
+                 }
+-- 

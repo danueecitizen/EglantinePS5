@@ -1,0 +1,90 @@
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+index 4f2c4ee3c0..18f25656a7 100644
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -103,6 +103,19 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
+     if (pending_acquire->Matches(current)) {
+         return true;
+     }
++    const bool delayed = Settings::IsGPUFenceBehaviorDefault()
++                             ? Settings::IsGPULevelHigh()
++                             : Settings::IsGPUFenceBehaviorBalanced() ||
++                                   Settings::IsGPUFenceBehaviorAccurate();
++    if (const auto now = std::chrono::steady_clock::now();
++        delayed && now - pending_acquire->last_fences >= std::chrono::milliseconds{1}) {
++        pending_acquire->last_fences = now;
++        ReleaseFencesOnBack(dma_pusher);
++        if (Nx2SemaphoreWaiters::Get().Latched(this) ||
++            pending_acquire->Matches(ReadSemaphoreWord(dma_pusher, pending_acquire->address))) {
++            return true;
++        }
++    }
+     if (!pending_acquire->reported &&
+         std::chrono::steady_clock::now() - pending_acquire->since > std::chrono::seconds{2}) {
+         pending_acquire->reported = true;
+@@ -251,6 +264,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+             .value = regs.semaphore_sequence,
+             .operation = static_cast<u32>(op),
+             .since = std::chrono::steady_clock::now(),
++            .last_fences = std::chrono::steady_clock::now(),
+             .reported = false,
+         };
+         if (op != GpuSemaphoreOperation::AcquireEqual && op != GpuSemaphoreOperation::AcquireGequal &&
+diff --git a/src/video_core/engines/puller.h b/src/video_core/engines/puller.h
+index 2b9e2c5df3..3cc9dc9b39 100644
+--- a/src/video_core/engines/puller.h
++++ b/src/video_core/engines/puller.h
+@@ -78,6 +78,7 @@ public:
+         u32 value;
+         u32 operation;
+         std::chrono::steady_clock::time_point since;
++        std::chrono::steady_clock::time_point last_fences;
+         bool reported;
+ 
+         [[nodiscard]] bool Matches(u32 current) const;
+diff --git a/src/video_core/fence_manager.h b/src/video_core/fence_manager.h
+index d9f0ac2837..25d6a829db 100644
+--- a/src/video_core/fence_manager.h
++++ b/src/video_core/fence_manager.h
+@@ -152,6 +152,7 @@ public:
+                 wait_cv.notify_all();
+             });
+             SignalFence(std::move(func));
++            SubmitDeferred();
+             std::unique_lock lk(wait_mutex);
+             wait_cv.wait(
+                 lk, [&wait_finished] { return wait_finished.load(std::memory_order_relaxed); });
+@@ -187,6 +188,8 @@ protected:
+     virtual bool IsFenceSignaled(TFence& fence) const = 0;
+     /// Waits until a fence has been signalled by the host GPU.
+     virtual void WaitFence(TFence& fence) = 0;
++    /// Submits command work whose submission was deferred (Vulkan: Scheduler::DeferFlush).
++    virtual void SubmitDeferred() {}
+ 
+     VideoCore::RasterizerInterface& rasterizer;
+     Tegra::GPU& gpu;
+diff --git a/src/video_core/renderer_vulkan/vk_fence_manager.cpp b/src/video_core/renderer_vulkan/vk_fence_manager.cpp
+index b22bc32e9e..10083ae8d3 100644
+--- a/src/video_core/renderer_vulkan/vk_fence_manager.cpp
++++ b/src/video_core/renderer_vulkan/vk_fence_manager.cpp
+@@ -74,4 +74,8 @@ void FenceManager::WaitFence(Fence& fence) {
+     fence->Wait();
+ }
+ 
++void FenceManager::SubmitDeferred() {
++    scheduler.FlushDeferred();
++}
++
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_fence_manager.h b/src/video_core/renderer_vulkan/vk_fence_manager.h
+index 3365735743..0a2ef5fdf4 100644
+--- a/src/video_core/renderer_vulkan/vk_fence_manager.h
++++ b/src/video_core/renderer_vulkan/vk_fence_manager.h
+@@ -62,6 +62,7 @@ protected:
+     void QueueFence(Fence& fence) override;
+     bool IsFenceSignaled(Fence& fence) const override;
+     void WaitFence(Fence& fence) override;
++    void SubmitDeferred() override;
+ 
+ private:
+     Scheduler& scheduler;
