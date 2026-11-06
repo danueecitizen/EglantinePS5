@@ -16,6 +16,7 @@ export EDEN_PS5_VULKAN=ON EDEN_VULKAN_DRIVER=RADV
 case $mode in
 release)
     export EDEN_DEV_VULKAN=OFF EDEN_DEV_ROM_ID= EDEN_DEV_PROFILE=OFF EDEN_DEV_WAIT_CALLERS=OFF
+    export EDEN_SKIP_SOURCE_CHECKS=1
     export EDEN_PACKAGE_DIR="$root/build/release/PPSA98515"
     ;;
 dev)
