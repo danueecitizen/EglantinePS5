@@ -1,0 +1,59 @@
+From 20fcadd50d4b9a9327d9644acd5a96b46a4d1568 Mon Sep 17 00:00:00 2001
+From: danueecitizen <danueecitizen@gmail.com>
+Date: Sat, 7 Nov 2026 18:50:01 -0400
+Subject: [PATCH 5/5] LOCAL TEST: EDEN_NX2_SWAP_INTERVAL doesn't apply while
+ video frames are decoded
+
+From Djihads80/Eglantine 854b81b1.
+Exempts 60 fps AV1 cutscenes in OoT from forced swap intervals.
+---
+ src/core/hle/service/nx2_gsv.h | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+index dea70ea..e502fe6 100644
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -74,6 +74,9 @@
+ 
+ namespace Service {
+ 
++/// LOCAL TEST (Zelda): steady-clock time of the last decoded video frame (PaceToVblank).
++inline std::atomic<s64> g_nx2_video_last_frame_ns{0};
++
+ // Creates a session served by `iface` and returns its client end. Unlike PushIpcInterface this
+ // works from a domain too, for callers that want a raw session handle.
+ template <class T>
+@@ -1983,7 +1986,16 @@ private:
+         if (mkw_dynamic) {
+             swap_interval = 1;
+         }
+-        if (forced_interval != 0) {
++        // LOCAL TEST (Zelda): not while a video plays. Ocarina's cutscene videos are 60 fps AV1;
++        // forced to two vblanks a frame they played at half rate.
++        const s64 video_ns = g_nx2_video_last_frame_ns.load(std::memory_order_relaxed);
++        const bool video_playing =
++            video_ns != 0 &&
++            std::chrono::steady_clock::now().time_since_epoch().count() - video_ns <
++                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
++                    std::chrono::milliseconds{500})
++                    .count();
++        if (forced_interval != 0 && !video_playing) {
+             swap_interval = forced_interval;
+         }
+         const u32 refresh_rate = (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
+@@ -2924,6 +2936,11 @@ private:
+             if (input.end) {
+                 decoder->Drain(pictures);
+             }
++            if (!pictures.empty()) {
++                g_nx2_video_last_frame_ns.store(
++                    std::chrono::steady_clock::now().time_since_epoch().count(),
++                    std::memory_order_relaxed);
++            }
+             lk.lock();
+             if (m_flush) {
+                 continue;
+-- 
+2.52.0.windows.1
+

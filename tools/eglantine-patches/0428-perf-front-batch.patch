@@ -1,0 +1,109 @@
+From 1aee5c3412497155573cb841d768f4b09e638ea4 Mon Sep 17 00:00:00 2001
+From: danueecitizen <danueecitizen@gmail.com>
+Date: Sat, 7 Nov 2026 18:50:01 -0400
+Subject: [PATCH 2/5] LOCAL TEST: EDEN_NX2_FRONT_BATCH sends runs of
+ incrementing 3D writes to split front in one call
+
+From Djihads80/Eglantine ed6632e2.
+Batch incrementing register writes to Maxwell 3D FrontWriteRun instead of per-word dispatch.
+---
+ src/video_core/dma_pusher.cpp         | 39 +++++++++++++++++++++++++++
+ src/video_core/engines/maxwell_3d.cpp |  8 ++++++
+ src/video_core/engines/maxwell_3d.h   |  5 ++++
+ 3 files changed, 52 insertions(+)
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index f56bab0..67e47c8 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -343,6 +343,15 @@ static const u32 g_semaphore_watch = [] {
+     return value ? static_cast<u32>(std::strtoull(value, nullptr, 16)) : 0U;
+ }();
+ 
++// LOCAL TEST (Zelda): EDEN_NX2_FRONT_BATCH=1 (see ProcessCommands).
++static bool FrontBatchEnabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("EDEN_NX2_FRONT_BATCH");
++        return value != nullptr && value[0] == '1';
++    }();
++    return enabled;
++}
++
+ // EDEN_NX2_PB_CHECK also keeps the last parsed entries, for DumpCurrentEntry.
+ static const bool g_record_parsed_entries = std::getenv("EDEN_NX2_PB_CHECK") != nullptr;
+ 
+@@ -361,6 +370,36 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
+             dma_state.is_last_call = true;
+             index += max_write;
+         } else if (dma_state.method_count) {
++            // LOCAL TEST (Zelda), EDEN_NX2_FRONT_BATCH=1: with the split's front running the 3D
++            // engine (FrontCallMethod), a run of incrementing register writes goes to it in one
++            // call instead of CallMethod's per-word dispatch (engine lookup, writer and effect
++            // checks, Front()). A 3D register write can't suspend the channel, so the acquire
++            // check after the run is enough.
++            if (!dma_state.non_incrementing && !dma_increment_once &&
++                dma_state.method >= non_puller_methods && dma_state.method < MacroRegistersStart &&
++                g_semaphore_watch == 0 && FrontBatchEnabled()) {
++                auto& split = VideoCommon::GpuSplit::Get();
++                auto* const subchannel = subchannels[dma_state.subchannel];
++                if (subchannel != nullptr && split.Active() && split.FrontMacros() &&
++                    subchannel_type[dma_state.subchannel] == Engines::EngineTypes::Maxwell3D) {
++                    auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
++                    const size_t available =
++                        (std::min)({size_t{dma_state.method_count}, commands.size() - index,
++                                    size_t{MacroRegistersStart - dma_state.method}});
++                    if (maxwell3d->GetNativeMacroEngine().native_turing && available > 1) {
++                        const u32 count = static_cast<u32>(available);
++                        const bool ends = count == dma_state.method_count;
++                        dma_state.dma_word_offset = u64((word_offset + index + count - 1) * sizeof(u32));
++                        dma_state.is_last_call = ends;
++                        maxwell3d->FrontWriteRun(system, split, dma_state.method,
++                                                 &commands[index].argument, count, ends);
++                        dma_state.method += count;
++                        dma_state.method_count -= count;
++                        index += count;
++                        continue;
++                    }
++                }
++            }
+             // Fast-path batching for consecutive non-execution methods in increasing mode
+             if (!dma_state.non_incrementing && !dma_increment_once &&
+                 dma_state.method >= non_puller_methods &&
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index f4c08f9..835f103 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -1101,6 +1101,14 @@ void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& spl
+     FrontWrite(split, fs, method, argument, is_last_call, false);
+ }
+ 
++void Maxwell3D::FrontWriteRun(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
++                              const u32* words, u32 count, bool ends_method) {
++    auto& fs = Front(system, split);
++    for (u32 i = 0; i < count; ++i) {
++        FrontWrite(split, fs, method + i, words[i], ends_method && i + 1 == count, false);
++    }
++}
++
+ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split,
+                                      u32 method, const u32* base_start, u32 amount,
+                                      u32 methods_pending) {
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index 4483d1c..9f91d78 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3214,6 +3214,11 @@ public:
+                          u32 argument, bool is_last_call);
+     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+                               const u32* base_start, u32 amount, u32 methods_pending);
++    /// LOCAL TEST (Zelda), EDEN_NX2_FRONT_BATCH=1: `count` incrementing register writes from
++    /// `method` on (all below the macro range), as `count` FrontCallMethod calls would make them.
++    /// `ends_method`: the last word is the method's last.
++    void FrontWriteRun(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
++                       const u32* words, u32 count, bool ends_method);
+ 
+     bool ShouldExecute() const {
+         return execute_on;
+-- 
+2.52.0.windows.1
+
