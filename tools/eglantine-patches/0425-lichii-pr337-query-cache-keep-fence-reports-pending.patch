@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Inc0rporate <inc0rporate@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 23:40:00 +0100
+Subject: [PATCH] query_cache: keep fence-flagged reports pending until their
+ fence runs (Ocarina white flashes)
+
+From Lichii PR 337 (Inc0rporate).
+
+A fence that writes a fence-flagged query report is never skipped as empty: a skipped
+fence runs its operation at once, before the host GPU has run the work the report
+follows, and Ocarina of Time then reads a wrong report (white flashes on leaves and walls
+at low GPU accuracy / Fast GPU mode).
+
+Also drops is_synced in CounterReport so that query reports wait for the fence callback
+instead of being freed and ignored immediately.
+---
+diff --git a/src/video_core/fence_manager.h b/src/video_core/fence_manager.h
+index d9f0ac2..342fce0 100644
+--- a/src/video_core/fence_manager.h
++++ b/src/video_core/fence_manager.h
+@@ -81,7 +81,15 @@ public:
+ 
+     void SignalFence(std::function<void()>&& func) {
+         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
+-        const bool delay_fence = Settings::IsGPUFenceBehaviorDefault() ? Settings::IsGPULevelHigh() : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
++        // A fence that writes a fence-flagged query report is never skipped as empty: a skipped
++        // fence runs its operation at once, before the host GPU has run the work the report
++        // follows, and Ocarina of Time then reads a wrong report (white flashes on leaves and walls
++        // at low GPU accuracy).
++        const bool delay_fence = VideoCore::g_signaling_query_report_fence ||
++                                 (Settings::IsGPUFenceBehaviorDefault()
++                                      ? Settings::IsGPULevelHigh()
++                                      : Settings::IsGPUFenceBehaviorBalanced() ||
++                                            Settings::IsGPUFenceBehaviorAccurate());
+         if constexpr (!can_async_check) {
+             TryReleasePendingFences<false>();
+         }
+diff --git a/src/video_core/query_cache/query_cache.h b/src/video_core/query_cache/query_cache.h
+index 60ca50e..155bb15 100644
+--- a/src/video_core/query_cache/query_cache.h
++++ b/src/video_core/query_cache/query_cache.h
+@@ -272,21 +272,16 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
+     };
+     u8* pointer = impl->device_memory.template GetPointer<u8>(cpu_addr);
+     u8* pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
+-    bool is_synced = (Settings::IsGPUFenceBehaviorDefault() ? !Settings::IsGPULevelHigh() : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate()) && is_fence;
+-    std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
++    std::function<void()> operation([this, streamer, query_base = query, query_location,
+                                      pointer, pointer_timestamp, cpu_addr] {
+         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
+-            if (!is_synced) [[likely]] {
+-                impl->pending_unregister.push_back(query_location);
+-            }
++            impl->pending_unregister.push_back(query_location);
+             return;
+         }
+         if (False(query_base->flags & QueryFlagBits::IsFinalValueSynced)) [[unlikely]] {
+             LOG_ERROR(HW_GPU,
+                       "Query report value not synchronized. Consider increasing GPU accuracy.");
+-            if (!is_synced) [[likely]] {
+-                impl->pending_unregister.push_back(query_location);
+-            }
++            impl->pending_unregister.push_back(query_location);
+             return;
+         }
+         query_base->value += streamer->GetAmendValue();
+@@ -300,12 +295,12 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
+             std::memcpy(pointer, &value, sizeof(value));
+         }
+         Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, static_cast<u32>(query_base->value));
+-        if (!is_synced) [[likely]] {
+-            impl->pending_unregister.push_back(query_location);
+-        }
++        impl->pending_unregister.push_back(query_location);
+     });
+     if (is_fence) {
++        VideoCore::g_signaling_query_report_fence = true;
+         impl->rasterizer.SignalFence(std::move(operation));
++        VideoCore::g_signaling_query_report_fence = false;
+     } else {
+         if (!Settings::IsGPULevelHigh() && counter_type == QueryType::Payload) {
+             if (has_timestamp) {
+@@ -322,10 +317,6 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
+         }
+         impl->rasterizer.SyncOperation(std::move(operation));
+     }
+-    if (is_synced) {
+-        streamer->Free(new_query_id);
+-        return;
+-    }
+     auto [cont_addr, base] = gen_caching_indexing(cpu_addr);
+     {
+         std::scoped_lock lock(cache_mutex);
+diff --git a/src/video_core/rasterizer_interface.h b/src/video_core/rasterizer_interface.h
+index 133a444..d4e3552 100644
+--- a/src/video_core/rasterizer_interface.h
++++ b/src/video_core/rasterizer_interface.h
+@@ -43,6 +43,10 @@ enum class LoadCallbackStage {
+ };
+ using DiskResourceLoadCallback = std::function<void(LoadCallbackStage, std::size_t, std::size_t)>;
+ 
++/// Set while the query cache signals the fence that writes a fence-flagged report, so the fence
++/// manager makes that fence even when it is empty (FenceManager::SignalFence).
++inline thread_local bool g_signaling_query_report_fence = false;
++
+ class RasterizerInterface {
+ public:
+     virtual ~RasterizerInterface() = default;
